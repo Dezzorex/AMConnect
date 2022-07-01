@@ -3,11 +3,15 @@ const char* ssid = "wifi";
 const char* password = "password";
 
 // mqtt settings
-const char* mqtt_server = "YOUR_MQTT_BROKER_IP_ADDRESS";
+const char* mqtt_server = "YOUR_MQTT_BROKER_IP_ADDRESS0";
 const char* mqtt_username = "username";
 const char* mqtt_password = "password";
 const char* mqtt_command_topic = "automower/command";
 const char* mqtt_debug_topic = "automower/debug";
+const char* mqtt_uptime_topic = "automower/uptime";
+const char* mqtt_rssi_topic = "automower/rssi";
+const char* mqtt_freeheap_topic = "automower/freeheap";
+const char* mqtt_ip_topic = "automower/ip";
 const char* mqtt_status_topic = "automower/status";
 const char* mqtt_location_topic = "automower/location";
 const char* mqtt_preferences_topic = "automower/preferences";
@@ -20,8 +24,9 @@ const char* mqtt_lwt_topic = "automower/lwt";
 #define AMSerialTX 2
 
 // Define the port used for GPS. In this case, Serial2 on default pins (RX 16, TX 17)
-#define gpsPort Serial2
-#define GPS_PORT_NAME "Serial2"
+#define gpsPort Serial2 //ESP32 pins 16RX, 17TX  UART02
+#define GPS_PORT_NAME "ESP32_Serial2"
+#define BAUD_GPS 9600
 
 // Define the debug serial port
 #define DEBUG_PORT Serial
