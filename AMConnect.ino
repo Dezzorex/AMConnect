@@ -1,4 +1,4 @@
-//======================================================================
+ //======================================================================
 //  Program: AMConnect
 //
 //  Description:  Connects Husqvarna Automower Generaton 2 to MQTT.
@@ -49,12 +49,30 @@ unsigned int localPollInterval;
 
 uint8_t lastCommand[5] = { 0xFF, 0xFF, 0xFF, 0xFF, 0xFF }; 
 
+//Timer for Restart
+unsigned long startupMillis;
+unsigned long restartInterval = 3600000;
+bool restartIntervalActive = false;
+
+//Timer for Wifi reconnect
+unsigned long wifiPreviousMillis = 0;
+unsigned long wifiInterval = 30000;
+unsigned long wifiReconnectCount = 0;
+unsigned long wifiReconnectRestartInterval = 60;
+
+unsigned long mqttReconnectCount = 0;
+
+bool enableSerialDebug = false;
+bool enableMQTTDebug = true;
+
 void setup()
 {
   DEBUG_PORT.begin(9600);
   while (!Serial)
     ;
   DEBUG_PORT.print( F("AMConnect: started\n") );
+
+  startupMillis = millis();
 
   // Start wifi 
   setup_wifi();
@@ -70,11 +88,22 @@ void setup()
   // Send status request to the automower
 
   // Start the GPS port
-  gpsPort.begin(9600);
+  gpsPort.begin(BAUD_GPS);
 
   // Set gpsMillis
   gpsMillis = millis();
   pollMillis = millis();
+
+  gpsPort.println(F("$PUBX,40,VTG,0,0,0,0*5E")); //VTG OFF
+  delay(100);
+  //gpsPort.println(F("$PUBX,40,GGA,0,0,0,0*5A")); //GGA OFF
+  //delay(100);
+  gpsPort.println(F("$PUBX,40,GSA,0,0,0,0*4E")); //GSA OFF
+  delay(100);
+  gpsPort.println(F("$PUBX,40,GSV,0,0,0,0*59")); //GSV OFF
+  delay(100);
+  gpsPort.println(F("$PUBX,40,GLL,0,0,0,0*5C")); //GLL OFF
+  delay(100);
 
   // start ArduinoOTA
   ArduinoOTA.setHostname("AMClient");
@@ -117,6 +146,17 @@ void setup()
 // Main loop
 void loop()
 {
+
+  if (restartIntervalActive && millis() - startupMillis >= restartInterval) {
+    handle_debug(true, (String)"Restarting in 10 seconds...");
+    delay(10000);
+    ESP.restart();
+  }
+
+  // if WiFi is down, try reconnecting every CHECK_WIFI_TIME seconds
+  if ((WiFi.status() != WL_CONNECTED) && (millis() - wifiPreviousMillis >=wifiInterval)) {
+    reconnect_wifi();
+  }
   // Check if MQTT is connected 
   if (!client.connected()) {
     reconnect();
@@ -233,15 +273,38 @@ void callback(char* topic, byte* message, unsigned int length) {
   }
 }
 
+void reconnect_wifi() {
+      // if WiFi has not been able to reconnect in X tries, reboot just to clear up everything
+    if ( wifiReconnectCount >= wifiReconnectRestartInterval ) 
+    {
+        handle_debug(true, (String)"Restarting in 10 seconds...");
+        delay(10000);
+        ESP.restart();
+    }
+    else {
+         handle_debug(false, (String)millis());
+         handle_debug(false, (String)"Reconnecting to WiFi...");
+         WiFi.disconnect();
+         WiFi.reconnect();
+         wifiPreviousMillis = millis();
+         wifiReconnectCount = wifiReconnectCount + 1; 
+    }
+}
+
 void reconnect() {
   // Loop until we're reconnected
   while (!client.connected()) {
+
+    // If Wifi isnt connected, lets try to reconnect that before we reconnect to mqtt. 
+    if ((WiFi.status() != WL_CONNECTED) && (millis() - wifiPreviousMillis >=wifiInterval)) {
+      reconnect_wifi();
+    }
     handle_debug(false, "Attempting MQTT connection...");
     // Attempt to connect
-    if (client.connect("AMClient", mqtt_username, mqtt_password, mqtt_lwt_topic, 1, true, "Offline")) {
+    if (client.connect("AMClient", mqtt_username, mqtt_password, mqtt_lwt_topic, 1, true, "Offline", 0)) {
       handle_debug(false, "MQTT connected");
       // Subscribe to commands
-      client.subscribe(mqtt_command_topic);
+      client.subscribe(mqtt_command_topic, 1);
       // Subscribe to preferences
       client.subscribe(mqtt_preferences_topic);
       // Set LWT to Online
@@ -251,6 +314,7 @@ void reconnect() {
       // Wait 5 seconds before retrying
       delay(5000);
     }
+    mqttReconnectCount = mqttReconnectCount + 1;
   }
 }
 
@@ -271,17 +335,21 @@ void handle_gps() {
   strncat(locationString, ",", positionSize - strlen(locationString));
   strncat(locationString, longitudeString, positionSize - strlen(locationString));
   // locationString = latitudeString + "," + longitudeString;
-  handle_debug(true, (String)"Location: " + (String)locationString);
+  //handle_debug(true, (String)"Location: " + (String)locationString);
+  //if (fix.valid.altitude)
+      //handle_debug(true, (String)"Altitude: " + (String)fix.altitude());
   client.publish(mqtt_location_topic, locationString);
 }
 
 void handle_debug(bool sendmqtt, String debugmsg) {
   // Handle the debug output
-  DEBUG_PORT.println(debugmsg);
-
+  if (enableSerialDebug)
+  {
+    DEBUG_PORT.println(debugmsg);
+  }
   
   // send to mqtt_command_topic
-  if (sendmqtt && client.connected())
+  if (enableMQTTDebug && sendmqtt && client.connected())
   {
     char debugChar[50];
     debugmsg.toCharArray(debugChar,50);
@@ -291,7 +359,7 @@ void handle_debug(bool sendmqtt, String debugmsg) {
 
 void handle_status(int statusCode, String statusMsg) {
   // Send to debug
-  handle_debug(true, statusMsg);
+  handle_debug(true, (String)"Status: " + statusMsg);
   
   // send to mqtt_status_topic
   if (client.connected())
@@ -303,33 +371,109 @@ void handle_status(int statusCode, String statusMsg) {
 }
 
 void handle_uptime() {
-  String uptime = "Up " + (String)uptime_formatter::getUptime();
+  String uptime = (String)uptime_formatter::getUptime();
   
   // send to mqtt_debug_topic
   if (client.connected())
   {
     char statusChar[50];
     uptime.toCharArray(statusChar,50);
-    client.publish(mqtt_debug_topic, statusChar);
+    //client.publish(mqtt_debug_topic, statusChar);
+    handle_debug(true, (String)"Up: " + uptime);
+    client.publish(mqtt_uptime_topic, statusChar);
   }
 }
 
+void handle_wifi_rssi() {
+  String rssi = (String)WiFi.RSSI();
+  
+  // send to mqtt_debug_topic
+  if (client.connected())
+  {
+    char statusChar[50];
+    rssi.toCharArray(statusChar,50);
+    //client.publish(mqtt_debug_topic, statusChar);
+    handle_debug(true, (String)"RSSI: " + rssi);
+    client.publish(mqtt_rssi_topic, statusChar);
+  }
+}
+
+void handle_wifi_ip() {
+  String ip = WiFi.localIP().toString();
+  
+  // send to mqtt_debug_topic
+  if (client.connected())
+  {
+    char statusChar[50];
+    ip.toCharArray(statusChar,50);
+    //client.publish(mqtt_debug_topic, statusChar);
+    handle_debug(true, (String)"IP-adress: " + ip);
+    client.publish(mqtt_ip_topic, statusChar);
+  }
+}
+
+void handle_free_heap() {
+  String freeHeap = (String)ESP.getFreeHeap();
+  
+  // send to mqtt_debug_topic
+  if (client.connected())
+  {
+    char statusChar[50];
+    freeHeap.toCharArray(statusChar,50);
+    //client.publish(mqtt_debug_topic, statusChar);
+    handle_debug(true, (String)"FreeHeap: " + freeHeap);
+    client.publish(mqtt_freeheap_topic, statusChar);
+  }
+  
+}
+
+void handle_wifi_reconnect_count() {
+  String count = (String)wifiReconnectCount;
+  
+  // send to mqtt_debug_topic
+  if (client.connected())
+  {
+    char statusChar[50];
+    count.toCharArray(statusChar,50);
+    //client.publish(mqtt_debug_topic, statusChar);
+    handle_debug(true, (String)"WiFi Reconnect Count: " + count);
+
+  }
+  
+}
+
+void handle_mqtt_reconnect_count() {
+  String count = (String)mqttReconnectCount;
+  
+  // send to mqtt_debug_topic
+  if (client.connected())
+  {
+    char statusChar[50];
+    count.toCharArray(statusChar,50);
+    //client.publish(mqtt_debug_topic, statusChar);
+    handle_debug(true, (String)"MQTT Reconnect Count: " + count);
+  }
+  
+}
+
+
+
 void handle_am() {
-	uint8_t statusAutomower[5] = { 0xFF, 0xFF, 0xFF, 0xFF, 0xFF };
-	uint8_t empty[5] = { 0xFF, 0xFF, 0xFF, 0xFF, 0xFF }; 
-	
-	Serial1.readBytes(statusAutomower,5);
-	
-	if(memcmp(statusAutomower, empty, 5) == 0) 
-	{
+  uint8_t statusAutomower[5] = { 0xFF, 0xFF, 0xFF, 0xFF, 0xFF };
+  uint8_t empty[5] = { 0xFF, 0xFF, 0xFF, 0xFF, 0xFF }; 
+  
+  Serial1.readBytes(statusAutomower,5);
+  
+  if(memcmp(statusAutomower, empty, 5) == 0) 
+  {
     handle_debug(true, "Unusable data received on serial");
-	} 
-	else 
-	{
+  } 
+  else 
+  {
     // values comes as DEC and not HEX
     handle_debug(true, "Byte1: " + (String)(statusAutomower[0]) + " Byte2: " + (String)(statusAutomower[1]) + " Byte3: " + (String)(statusAutomower[2]) + " Byte4: " + (String)(statusAutomower[3]) + " Byte5: " + (String)(statusAutomower[4]));
    
-	}
+  }
 
   // Merge the last two bytes to status
   unsigned int statusInt = statusAutomower[4] << 8 | statusAutomower[3];
@@ -345,7 +489,7 @@ void handle_am() {
       if (statusAutomower[2] == 0x5F) 
       {
         // Keypress
-		    switch (statusInt) {
+        switch (statusInt) {
           case 0: 
             handle_debug(true, "Key 0 pressed"); 
             break;
@@ -355,52 +499,52 @@ void handle_am() {
           case 2: 
             handle_debug(true, "Key 2 pressed");  
             break;
-		      case 3: 
+          case 3: 
             handle_debug(true, "Key 3 pressed");  
             break;
-	        case 4: 
+          case 4: 
             handle_debug(true, "Key 4 pressed");  
             break;
-		      case 5: 
+          case 5: 
             handle_debug(true, "Key 5 pressed");  
             break;
-		      case 6: 
+          case 6: 
             handle_debug(true, "Key 6 pressed"); 
             break;
-		      case 7: 
+          case 7: 
             handle_debug(true, "Key 7 pressed");  
             break;
-		      case 8: 
+          case 8: 
             handle_debug(true, "Key 8 pressed");  
             break;
-		      case 9: 
+          case 9: 
             handle_debug(true, "Key 9 pressed"); 
             break;
-		      case 10: 
+          case 10: 
             handle_debug(true, "Key Program A pressed");  
             break;
-		      case 11: 
+          case 11: 
             handle_debug(true, "Key Program B pressed"); 
             break;
-		      case 12: 
+          case 12: 
             handle_debug(true, "Key Program C pressed"); 
             break;
-		      case 13:  
+          case 13:  
             handle_debug(true, "Key Home pressed");
             break;
-		      case 14: 
+          case 14: 
             handle_debug(true, "Key Man/Auto pressed"); 
             break;
-		      case 15: 
+          case 15: 
             handle_debug(true, "Key C pressed");
             break;
-		      case 16: 
+          case 16: 
             handle_debug(true, "Key Up pressed");
             break;
-		      case 17: 
+          case 17: 
             handle_debug(true, "Key Down pressed"); 
             break;
-		      case 18: 
+          case 18: 
             handle_debug(true, "Key YES pressed");
             break;
           default: //no valid parameter: send status
@@ -425,7 +569,7 @@ void handle_am() {
           case 3: 
             handle_debug(true, "Home Mode");
             break;
-		      case 4: 
+          case 4: 
             handle_debug(true, "Demo Mode"); 
             break;
           default: //no valid parameter: send status
@@ -440,7 +584,7 @@ void handle_am() {
       if (statusAutomower[2] == 0x4E) 
       {
         // Timer actions
-		    switch (statusInt) {
+        switch (statusInt) {
           case 0: 
             handle_debug(true, "Timer activated");
             break;
@@ -932,7 +1076,15 @@ void handle_command(String command) {
   else if (command == "setTimerActivate") { memcpy(commandAutomower, amcTimerActivate, sizeof(commandAutomower)); }
   else if (command == "setTimerDeactivate") { memcpy(commandAutomower, amcTimerDeactivate, sizeof(commandAutomower)); }
   else if (command == "getUptime") { handle_uptime(); dowrite = false; }
-
+  else if (command == "enableSerialDebug") { enableSerialDebug = true; dowrite = false; }
+  else if (command == "disableSerialDebug") { enableSerialDebug = false; dowrite = false; }
+  else if (command == "enableMQTTDebug") { enableMQTTDebug = true; dowrite = false; }
+  else if (command == "disableMQTTDebug") { enableMQTTDebug = false; dowrite = false; }
+  else if (command == "getWifiRSSI") { handle_wifi_rssi();  dowrite = false; }
+  else if (command == "getWifiIP") { handle_wifi_ip();  dowrite = false; }
+  else if (command == "getWifiReconnectCount") { handle_wifi_reconnect_count(); dowrite = false; }
+  else if (command == "getMQTTReconnectCount") { handle_mqtt_reconnect_count(); dowrite = false; }
+  
   if (dowrite)
   {
     // send it to the automower
